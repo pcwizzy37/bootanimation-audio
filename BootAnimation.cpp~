@@ -83,7 +83,7 @@ BootAnimation::~BootAnimation() {
 void fork_sound(const char* path) {
     pid_t pid = fork();
     if (pid == 0) {
-    Sleep(7);
+    Sleep(5);
     execl("/system/bin/stagefright", "stagefright", "-o", "-a", path , NULL);
     }
 }

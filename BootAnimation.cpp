@@ -15,7 +15,7 @@
  */
 
 #define LOG_TAG "BootAnimation"
-#include <time.h> 
+
 #include <stdint.h>
 #include <sys/types.h>
 #include <math.h>
@@ -25,12 +25,12 @@
 
 #include <cutils/properties.h>
 
-#include <androidfw/AssetManager.h>
 #include <binder/IPCThreadState.h>
+#include <utils/threads.h>
 #include <utils/Atomic.h>
 #include <utils/Errors.h>
 #include <utils/Log.h>
-#include <utils/threads.h>
+#include <androidfw/AssetManager.h>
 
 #include <ui/PixelFormat.h>
 #include <ui/Rect.h>
@@ -46,6 +46,8 @@
 #include <core/SkStream.h>
 #include <images/SkImageDecoder.h>
 
+#include <media/mediaplayer.h>
+
 #include <GLES/gl.h>
 #include <GLES/glext.h>
 #include <EGL/eglext.h>
@@ -55,11 +57,6 @@
 #define USER_BOOTANIMATION_FILE "/data/local/bootanimation.zip"
 #define SYSTEM_BOOTANIMATION_FILE "/system/media/bootanimation.zip"
 #define SYSTEM_ENCRYPTED_BOOTANIMATION_FILE "/system/media/bootanimation-encrypted.zip"
-#define EXIT_PROP_NAME "service.bootanim.exit"
-
-extern "C" int clock_nanosleep(clockid_t clock_id, int flags,
-                           const struct timespec *request,
-                           struct timespec *remain);
 
 namespace android {
 
@@ -69,31 +66,15 @@ BootAnimation::BootAnimation() : Thread(false)
 {
     mSession = new SurfaceComposerClient();
 }
- 
- 
-using namespace std; 
- 
-void Sleep(float s) 
-{ 
-    int sec = int(s*1000000); 
-    usleep(sec); 
-} 
+
 BootAnimation::~BootAnimation() {
 }
-void fork_sound(const char* path) {
-    pid_t pid = fork();
-    if (pid == 0) {
-    Sleep(7);
-    execl("/system/bin/stagefright", "stagefright", "-o", "-a", path , NULL);
-    }
-}
+
 void BootAnimation::onFirstRef() {
     status_t err = mSession->linkToComposerDeath(this);
     ALOGE_IF(err, "linkToComposerDeath failed (%s) ", strerror(-err));
     if (err == NO_ERROR) {
         run("BootAnimation", PRIORITY_DISPLAY);
-        fork_sound("/system/media/bootsound.mp3");
-        
     }
 }
 
@@ -178,11 +159,7 @@ status_t BootAnimation::initTexture(void* buffer, size_t len)
     codec->setDitherImage(false);
     if (codec) {
         codec->decode(&stream, &bitmap,
-                #ifdef USE_565
                 SkBitmap::kRGB_565_Config,
-                #else
-                SkBitmap::kARGB_8888_Config,
-                #endif
                 SkImageDecoder::kDecodePixels_Mode);
         delete codec;
     }
@@ -237,14 +214,12 @@ status_t BootAnimation::initTexture(void* buffer, size_t len)
 status_t BootAnimation::readyToRun() {
     mAssets.addDefaultAssets();
 
-    sp<IBinder> dtoken(SurfaceComposerClient::getBuiltInDisplay(
-            ISurfaceComposer::eDisplayIdMain));
     DisplayInfo dinfo;
-    status_t status = SurfaceComposerClient::getDisplayInfo(dtoken, &dinfo);
+    status_t status = session()->getDisplayInfo(0, &dinfo);
     if (status)
         return -1;
 
-    // create the native surface
+// create the native surface
     sp<SurfaceControl> control = session()->createSurface(String8("BootAnimation"),
             dinfo.w, dinfo.h, PIXEL_FORMAT_RGB_565);
 
@@ -309,38 +284,6 @@ status_t BootAnimation::readyToRun() {
         mAndroidAnimation = false;
     }
 
-
-#ifdef PRELOAD_BOOTANIMATION
-    // Preload the bootanimation zip on memory, so we don't stutter
-    // when showing the animation
-    FILE* fd;
-    if (encryptedAnimation && access(SYSTEM_ENCRYPTED_BOOTANIMATION_FILE, R_OK) == 0)
-        fd = fopen(SYSTEM_ENCRYPTED_BOOTANIMATION_FILE, "r");
-    else if (access(USER_BOOTANIMATION_FILE, R_OK) == 0)
-        fd = fopen(USER_BOOTANIMATION_FILE, "r");
-    else if (access(SYSTEM_BOOTANIMATION_FILE, R_OK) == 0)
-        fd = fopen(SYSTEM_BOOTANIMATION_FILE, "r");
-    else
-        return NO_ERROR;
-
-    if (fd != NULL) {
-        // We could use readahead..
-        // ... if bionic supported it :(
-        //readahead(fd, 0, INT_MAX);
-        void *crappyBuffer = malloc(2*1024*1024);
-        if (crappyBuffer != NULL) {
-            // Read all the zip
-            while (!feof(fd))
-                fread(crappyBuffer, 1024, 2*1024, fd);
-
-            free(crappyBuffer);
-        } else {
-            ALOGW("Unable to allocate memory to preload the animation");
-        }
-        fclose(fd);
-    }
-#endif
-
     return NO_ERROR;
 }
 
@@ -352,9 +295,6 @@ bool BootAnimation::threadLoop()
     } else {
         r = movie();
     }
-
-    // No need to force exit anymore
-    property_set(EXIT_PROP_NAME, "0");
 
     eglMakeCurrent(mDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     eglDestroyContext(mDisplay, mContext);
@@ -422,8 +362,6 @@ bool BootAnimation::android()
         const nsecs_t sleepTime = 83333 - ns2us(systemTime() - now);
         if (sleepTime > 0)
             usleep(sleepTime);
-
-        checkExit();
     } while (!exitPending());
 
     glDeleteTextures(1, &mAndroid[0].name);
@@ -432,18 +370,32 @@ bool BootAnimation::android()
 }
 
 
-void BootAnimation::checkExit() {
-    // Allow surface flinger to gracefully request shutdown
-    char value[PROPERTY_VALUE_MAX];
-    property_get(EXIT_PROP_NAME, value, "0");
-    int exitnow = atoi(value);
-    if (exitnow) {
-        requestExit();
-    }
-}
-
 bool BootAnimation::movie()
 {
+
+    char bootenabled[PROPERTY_VALUE_MAX];
+    char bootsound[PROPERTY_VALUE_MAX];
+    char bootvolume[PROPERTY_VALUE_MAX];
+    property_get("persist.sys.boot_enabled", bootenabled, "1");
+    property_get("persist.sys.boot_sound", bootsound, "1");
+    property_get("persist.sys.boot_volume", bootvolume, "0.2");
+
+    bool bootEnabled = atoi(bootenabled) != 0;
+    bool enableSound = atoi(bootsound) != 0;
+    float bootVolume = strtof(bootvolume, NULL);
+
+    if(!bootEnabled) {
+        return false;
+    }
+
+    if(enableSound){
+      sp<MediaPlayer> mediaplay = new MediaPlayer();
+      mediaplay->setDataSource ("/system/media/boot_audio.mp3", NULL);
+        mediaplay->setVolume (bootVolume, bootVolume);
+      mediaplay->prepare();
+      mediaplay->start();
+    }        
+
     ZipFileRO& zip(mZip);
 
     size_t numEntries = zip.getNumEntries();
@@ -468,23 +420,20 @@ bool BootAnimation::movie()
         const char* l = line.string();
         int fps, width, height, count, pause;
         char path[256];
-        char pathType;
         if (sscanf(l, "%d %d %d", &width, &height, &fps) == 3) {
-            //LOGD("> w=%d, h=%d, fps=%d", width, height, fps);
+            //ALOGD("> w=%d, h=%d, fps=%d", fps, width, height);
             animation.width = width;
             animation.height = height;
             animation.fps = fps;
         }
-        else if (sscanf(l, " %c %d %d %s", &pathType, &count, &pause, path) == 4) {
-            //LOGD("> type=%c, count=%d, pause=%d, path=%s", pathType, count, pause, path);
+        if (sscanf(l, "p %d %d %s", &count, &pause, path) == 3) {
+            //ALOGD("> count=%d, pause=%d, path=%s", count, pause, path);
             Animation::Part part;
-            part.playUntilComplete = pathType == 'c';
             part.count = count;
             part.pause = pause;
             part.path = path;
             animation.parts.add(part);
         }
-
         s = ++endl;
     }
 
@@ -498,7 +447,7 @@ bool BootAnimation::movie()
             const String8 path(entryName.getPathDir());
             const String8 leaf(entryName.getPathLeaf());
             if (leaf.size() > 0) {
-                for (size_t j=0 ; j<pcount ; j++) {
+                for (int j=0 ; j<pcount ; j++) {
                     if (path == animation.parts[j].path) {
                         int method;
                         // supports only stored png files
@@ -545,31 +494,25 @@ bool BootAnimation::movie()
 
     Region clearReg(Rect(mWidth, mHeight));
     clearReg.subtractSelf(Rect(xc, yc, xc+animation.width, yc+animation.height));
-
-    for (int i=0 ; i<pcount ; i++) {
+    for (int i=0 ; i<pcount && !exitPending() ; i++) {
         const Animation::Part& part(animation.parts[i]);
         const size_t fcount = part.frames.size();
-
-        // can be 1, 0, or not set
-        #ifdef NO_TEXTURE_CACHE
-        const int noTextureCache = NO_TEXTURE_CACHE;
-        #else
+#ifndef CACHE_BOOTANIM
         const int noTextureCache = ((animation.width * animation.height * fcount) >
                                  48 * 1024 * 1024) ? 1 : 0;
-        #endif
+#endif
 
         glBindTexture(GL_TEXTURE_2D, 0);
 
         for (int r=0 ; !part.count || r<part.count ; r++) {
-            // Exit any non playuntil complete parts immediately
-            if(exitPending() && !part.playUntilComplete)
-                break;
-
-            for (int j=0 ; j<fcount && (!exitPending() || part.playUntilComplete) ; j++) {
+            for (int j=0 ; j<fcount && !exitPending(); j++) {
                 const Animation::Frame& frame(part.frames[j]);
-                nsecs_t lastFrame = systemTime();
 
+#ifndef CACHE_BOOTANIM
                 if (r > 0 && !noTextureCache) {
+#else
+		if (r > 0) {
+#endif
                     glBindTexture(GL_TEXTURE_2D, frame.tid);
                 } else {
                     if (part.count != 1) {
@@ -600,35 +543,25 @@ bool BootAnimation::movie()
 
                 nsecs_t now = systemTime();
                 nsecs_t delay = frameDuration - (now - lastFrame);
-                //ALOGD("%lld, %lld", ns2ms(now - lastFrame), ns2ms(delay));
                 lastFrame = now;
-
-                if (delay > 0) {
-                    struct timespec spec;
-                    spec.tv_sec  = (now + delay) / 1000000000;
-                    spec.tv_nsec = (now + delay) % 1000000000;
-                    int err;
-                    do {
-                        err = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &spec, NULL);
-                    } while (err<0 && errno == EINTR);
-                }
-
-                checkExit();
-
+                long wait = ns2us(frameDuration);
+                if (wait > 0)
+                    usleep(wait);
+#ifndef CACHE_BOOTANIM
                 if (noTextureCache)
                     glDeleteTextures(1, &frame.tid);
+#endif
             }
-
             usleep(part.pause * ns2us(frameDuration));
-
-            // For infinite parts, we've now played them at least once, so perhaps exit
-            if(exitPending() && !part.count)
-                break;
         }
 
         // free the textures for this part
+#ifndef CACHE_BOOTANIM
         if (part.count != 1 && !noTextureCache) {
-            for (size_t j=0 ; j<fcount ; j++) {
+#else
+	if (part.count != 1) {
+#endif
+            for (int j=0 ; j<fcount ; j++) {
                 const Animation::Frame& frame(part.frames[j]);
                 glDeleteTextures(1, &frame.tid);
             }

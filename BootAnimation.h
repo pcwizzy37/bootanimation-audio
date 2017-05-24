@@ -20,8 +20,13 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-#include <androidfw/AssetManager.h>
 #include <utils/threads.h>
+#include <androidfw/AssetManager.h>
+
+#include <gui/ISurfaceComposer.h>
+#include <gui/SurfaceComposerClient.h>
+
+#include <media/mediaplayer.h>
 
 #include <EGL/egl.h>
 #include <GLES/gl.h>
@@ -30,9 +35,7 @@ class SkBitmap;
 
 namespace android {
 
-class Surface;
-class SurfaceComposerClient;
-class SurfaceControl;
+class AssetManager;
 
 // ---------------------------------------------------------------------------
 
@@ -43,6 +46,7 @@ public:
     virtual     ~BootAnimation();
 
     sp<SurfaceComposerClient> session() const;
+    sp<MediaPlayer> mediaplay;
 
 private:
     virtual bool        threadLoop();
@@ -70,7 +74,6 @@ private:
             int pause;
             String8 path;
             SortedVector<Frame> frames;
-            bool playUntilComplete;
         };
         int fps;
         int width;
@@ -83,8 +86,6 @@ private:
     bool android();
     bool movie();
 
-    void checkExit();
-
     sp<SurfaceComposerClient>       mSession;
     AssetManager mAssets;
     Texture     mAndroid[2];
@@ -95,6 +96,7 @@ private:
     EGLDisplay  mSurface;
     sp<SurfaceControl> mFlingerSurfaceControl;
     sp<Surface> mFlingerSurface;
+
     bool        mAndroidAnimation;
     ZipFileRO   mZip;
 };

@@ -25,6 +25,9 @@
 #include <utils/Log.h>
 #include <utils/threads.h>
 
+#include <gui/ISurfaceComposer.h>
+#include <media/mediaplayer.h>
+
 #if defined(HAVE_PTHREADS)
 # include <pthread.h>
 # include <sys/resource.h>
@@ -53,7 +56,7 @@ int main(int argc, char** argv)
 
         // create the boot animation object
         sp<BootAnimation> boot = new BootAnimation();
-        
+
         IPCThreadState::self()->joinThreadPool();
 
     }
